@@ -308,6 +308,10 @@ struct GeneralMOEConfig {
 
   int max_cache_depth = 1;
 
+  // NUMA-local prefill mirror: if >= 0, a second copy of the weight
+  // BufferBs is kept on this NUMA node for fast layerwise-prefill H2D.
+  int prefill_numa_id = -1;
+
   GeneralMOEConfig() {}
 
   GeneralMOEConfig(int expert_num, int routed_expert_num, int hidden_size, int intermediate_size)

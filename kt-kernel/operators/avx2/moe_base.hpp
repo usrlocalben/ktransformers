@@ -61,6 +61,11 @@ class AVX2_MOE_BASE {
   std::vector<std::shared_ptr<typename T::BufferB>> down_bb_;
   std::vector<std::shared_ptr<typename T::BufferC>> down_bc_;
 
+  // Prefill mirror: NUMA-local weight copies for fast layerwise H2D
+  std::vector<std::shared_ptr<typename T::BufferB>> prefill_gate_bb_;
+  std::vector<std::shared_ptr<typename T::BufferB>> prefill_up_bb_;
+  std::vector<std::shared_ptr<typename T::BufferB>> prefill_down_bb_;
+
   size_t pool_count_ = 0;
   size_t gate_up_ba_pool_bytes_ = 0;
   size_t gate_bc_pool_bytes_ = 0;
@@ -158,6 +163,39 @@ class AVX2_MOE_BASE {
       weights[i] = 0.01;
     }
     forward(qlen, config_.num_experts_per_tok, expert_ids.data(), weights.data(), input.data(), output.data());
+  }
+
+  // Allocate NUMA-local weight buffers for prefill H2D mirror.
+  // Must be called from a worker already bound to the target NUMA node
+  // so that std::aligned_alloc lands on the correct socket.
+  void init_prefill_mirror() {
+    if (!prefill_gate_bb_.empty()) return;  // already initialized
+    for (size_t i = 0; i < config_.expert_num; i++) {
+      void* gate_ptr =
+          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      prefill_gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_ptr));
+
+      void* up_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      prefill_up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_ptr));
+
+      void* down_ptr =
+          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+      prefill_down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_ptr));
+    }
+  }
+
+  // Copy weight data from the original (decode) buffers to the prefill mirror.
+  // Both source and destination must be accessible by the calling thread.
+  void copy_to_prefill_mirror() {
+    if (prefill_gate_bb_.empty()) return;
+    for (size_t i = 0; i < config_.expert_num; i++) {
+      size_t gate_bytes = buffer_b_required_size(config_.intermediate_size, config_.hidden_size);
+      size_t up_bytes = buffer_b_required_size(config_.intermediate_size, config_.hidden_size);
+      size_t down_bytes = buffer_b_required_size(config_.hidden_size, config_.intermediate_size);
+      std::memcpy(prefill_gate_bb_[i]->b, gate_bb_[i]->b, gate_bytes);
+      std::memcpy(prefill_up_bb_[i]->b, up_bb_[i]->b, up_bytes);
+      std::memcpy(prefill_down_bb_[i]->b, down_bb_[i]->b, down_bytes);
+    }
   }
 
   void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {

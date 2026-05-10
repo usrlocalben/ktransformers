@@ -235,6 +235,9 @@ class AVX2_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_RAW_INT4_MOE_TP<T>> {
   using Base::gate_bc_;
   using Base::gate_up_ba_;
   using Base::m_local_num_;
+  using Base::prefill_down_bb_;
+  using Base::prefill_gate_bb_;
+  using Base::prefill_up_bb_;
   using Base::tp_part_idx;
   using Base::up_bb_;
   using Base::up_bc_;
@@ -557,6 +560,195 @@ class AVX2_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_RAW_INT4_MOE_TP<T>> {
           nullptr);
     }
   }
+
+  // Allocate full (weights + scales) prefill mirror regardless of whether the
+  // decode buffers use scale-only mode. The mirror must own a complete copy so
+  // that it can be copied to GPU buffers without depending on the original mmap.
+  void init_prefill_mirror() {
+    using BufferB = typename T::BufferB;
+    if (!prefill_gate_bb_.empty()) return;  // already initialized
+    for (size_t i = 0; i < config_.expert_num; i++) {
+      void* gate_ptr = std::aligned_alloc(64, BufferB::required_size(config_.intermediate_size, config_.hidden_size,
+                                                                    config_.quant_config.group_size));
+      prefill_gate_bb_.push_back(std::make_shared<BufferB>((int)config_.intermediate_size, (int)config_.hidden_size,
+                                                            config_.quant_config.group_size, gate_ptr));
+      void* up_ptr = std::aligned_alloc(64, BufferB::required_size(config_.intermediate_size, config_.hidden_size,
+                                                                  config_.quant_config.group_size));
+      prefill_up_bb_.push_back(std::make_shared<BufferB>((int)config_.intermediate_size, (int)config_.hidden_size,
+                                                          config_.quant_config.group_size, up_ptr));
+      void* down_ptr = std::aligned_alloc(64, BufferB::required_size(config_.hidden_size, config_.intermediate_size,
+                                                                     config_.quant_config.group_size));
+      prefill_down_bb_.push_back(std::make_shared<BufferB>((int)config_.hidden_size, (int)config_.intermediate_size,
+                                                            config_.quant_config.group_size, down_ptr));
+    }
+  }
+
+  // Copy both weight data and scales into the full prefill mirror.
+  // Safe even when source gate_bb_ uses per-expert external pointers.
+  void copy_to_prefill_mirror() {
+    if (prefill_gate_bb_.empty()) return;
+    const int gs = config_.quant_config.group_size;
+    for (size_t i = 0; i < config_.expert_num; i++) {
+      size_t gate_up_weight_bytes = (size_t)config_.intermediate_size * config_.hidden_size / 2;
+      size_t gate_up_scale_bytes = (size_t)config_.intermediate_size * (config_.hidden_size / gs) * sizeof(float);
+      size_t down_weight_bytes = (size_t)config_.hidden_size * config_.intermediate_size / 2;
+      size_t down_scale_bytes = (size_t)config_.hidden_size * (config_.intermediate_size / gs) * sizeof(float);
+      std::memcpy(prefill_gate_bb_[i]->b, gate_bb_[i]->b, gate_up_weight_bytes);
+      std::memcpy(prefill_gate_bb_[i]->d, gate_bb_[i]->d, gate_up_scale_bytes);
+      std::memcpy(prefill_up_bb_[i]->b, up_bb_[i]->b, gate_up_weight_bytes);
+      std::memcpy(prefill_up_bb_[i]->d, up_bb_[i]->d, gate_up_scale_bytes);
+      std::memcpy(prefill_down_bb_[i]->b, down_bb_[i]->b, down_weight_bytes);
+      std::memcpy(prefill_down_bb_[i]->d, down_bb_[i]->d, down_scale_bytes);
+    }
+  }
+
+  // Same as write_weights_to_buffer but reads from the NUMA-local prefill mirror.
+  void write_weights_to_buffer_prefill(int gpu_tp_count, int cpu_tp_count, int expert_id,
+                                       const GeneralMOEConfig& full_config,
+                                       const std::vector<uintptr_t>& w13_weight_ptrs,
+                                       const std::vector<uintptr_t>& w13_scale_ptrs,
+                                       const std::vector<uintptr_t>& w2_weight_ptrs,
+                                       const std::vector<uintptr_t>& w2_scale_ptrs) const {
+    if (expert_id < 0 || expert_id >= config_.expert_num || prefill_gate_bb_.empty() ||
+        prefill_gate_bb_[expert_id] == nullptr || prefill_up_bb_[expert_id] == nullptr ||
+        prefill_down_bb_[expert_id] == nullptr) {
+      throw std::runtime_error("RAWINT4 write_weights_to_buffer_prefill requested an expert without loaded mirror");
+    }
+    const int group_size = config_.quant_config.group_size;
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+
+    size_t cpu_tp_weight_elem_count = (size_t)config_.intermediate_size * config_.hidden_size;
+    size_t cpu_tp_weight_bytes = cpu_tp_weight_elem_count / 2;
+    size_t cpu_tp_scale_elem_count = cpu_tp_weight_elem_count / group_size;
+    size_t gpu_tp_weight_elem_count = (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count;
+    size_t gpu_tp_weight_bytes = gpu_tp_weight_elem_count / 2;
+    size_t gpu_tp_scale_elem_count = gpu_tp_weight_elem_count / group_size;
+
+    if (cpu_tp_count >= gpu_tp_count) {
+      int target_gpu_tp = tp_part_idx / (cpu_tp_count / gpu_tp_count);
+      int local_idx = tp_part_idx % (cpu_tp_count / gpu_tp_count);
+      uint8_t* w13_weight_dst = (uint8_t*)w13_weight_ptrs[target_gpu_tp];
+      ggml_bf16_t* w13_scale_dst = (ggml_bf16_t*)w13_scale_ptrs[target_gpu_tp];
+      uint8_t* w2_weight_dst = (uint8_t*)w2_weight_ptrs[target_gpu_tp];
+      ggml_bf16_t* w2_scale_dst = (ggml_bf16_t*)w2_scale_ptrs[target_gpu_tp];
+      size_t offset_in_gpu_weight = local_idx * cpu_tp_weight_bytes;
+      size_t offset_in_gpu_scale = local_idx * cpu_tp_scale_elem_count;
+
+      constexpr int NUM_WEIGHT_TASKS = 8;
+      constexpr int MIN_COLS_PER_TASK = 128;
+      int num_down_tasks = std::min(std::max(1, config_.hidden_size / MIN_COLS_PER_TASK), 32);
+      int total_tasks = NUM_WEIGHT_TASKS * 2 + num_down_tasks + 2;
+      size_t weight_chunk_size = (cpu_tp_weight_bytes + NUM_WEIGHT_TASKS - 1) / NUM_WEIGHT_TASKS;
+      weight_chunk_size = (weight_chunk_size + 63) & ~63ULL;
+
+      pool->do_work_stealing_job(
+          total_tasks, nullptr,
+          [=, this](int task_id) {
+            if (task_id < NUM_WEIGHT_TASKS) {
+              size_t start = (size_t)task_id * weight_chunk_size;
+              size_t end = std::min(start + weight_chunk_size, cpu_tp_weight_bytes);
+              if (start < end)
+                std::memcpy(w13_weight_dst + offset_in_gpu_weight + start,
+                            prefill_gate_bb_[expert_id]->b + start, end - start);
+            } else if (task_id < NUM_WEIGHT_TASKS * 2) {
+              int chunk_idx = task_id - NUM_WEIGHT_TASKS;
+              size_t start = (size_t)chunk_idx * weight_chunk_size;
+              size_t end = std::min(start + weight_chunk_size, cpu_tp_weight_bytes);
+              if (start < end)
+                std::memcpy(w13_weight_dst + offset_in_gpu_weight + gpu_tp_weight_bytes + start,
+                            prefill_up_bb_[expert_id]->b + start, end - start);
+            } else if (task_id < NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
+              int chunk_idx = task_id - NUM_WEIGHT_TASKS * 2;
+              size_t cols_per_chunk = (config_.hidden_size + num_down_tasks - 1) / num_down_tasks;
+              size_t col_start = (size_t)chunk_idx * cols_per_chunk;
+              size_t col_end = std::min(col_start + cols_per_chunk, (size_t)config_.hidden_size);
+              size_t weight_per_col = config_.intermediate_size >> 1;
+              size_t scale_per_col = config_.intermediate_size / group_size;
+              size_t gpu_weight_stride = (full_config.intermediate_size / gpu_tp_count) >> 1;
+              size_t gpu_scale_stride = (full_config.intermediate_size / gpu_tp_count) / group_size;
+              size_t gpu_weight_slice_offset = local_idx * weight_per_col;
+              size_t gpu_scale_slice_offset = local_idx * scale_per_col;
+              for (size_t col = col_start; col < col_end; col++) {
+                std::memcpy(w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset,
+                            prefill_down_bb_[expert_id]->b + col * weight_per_col, weight_per_col);
+                fp32_to_bf16(w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
+                             prefill_down_bb_[expert_id]->d + col * scale_per_col, scale_per_col);
+              }
+            } else if (task_id == NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
+              fp32_to_bf16(w13_scale_dst + offset_in_gpu_scale, prefill_gate_bb_[expert_id]->d,
+                           cpu_tp_scale_elem_count);
+            } else {
+              fp32_to_bf16(w13_scale_dst + offset_in_gpu_scale + gpu_tp_scale_elem_count,
+                           prefill_up_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+            }
+          },
+          nullptr);
+    } else {
+      int gpu_tps_per_cpu_tp = gpu_tp_count / cpu_tp_count;
+      int start_gpu_tp = tp_part_idx * gpu_tps_per_cpu_tp;
+      size_t data_per_gpu_tp_weight = cpu_tp_weight_bytes / gpu_tps_per_cpu_tp;
+      size_t data_per_gpu_tp_scale = cpu_tp_scale_elem_count / gpu_tps_per_cpu_tp;
+      constexpr int NUM_WEIGHT_TASKS = 8;
+      constexpr int MIN_COLS_PER_TASK = 128;
+      int num_down_tasks = std::min(std::max(1, config_.hidden_size / MIN_COLS_PER_TASK), 32);
+      int tasks_per_gpu_tp = NUM_WEIGHT_TASKS * 2 + num_down_tasks + 2;
+      int total_tasks = tasks_per_gpu_tp * gpu_tps_per_cpu_tp;
+      size_t weight_chunk_size = (data_per_gpu_tp_weight + NUM_WEIGHT_TASKS - 1) / NUM_WEIGHT_TASKS;
+      weight_chunk_size = (weight_chunk_size + 63) & ~63ULL;
+
+      pool->do_work_stealing_job(
+          total_tasks, nullptr,
+          [=, this, &w13_weight_ptrs, &w13_scale_ptrs, &w2_weight_ptrs, &w2_scale_ptrs](int task_id) {
+            int local_gpu_idx = task_id / tasks_per_gpu_tp;
+            int task_type = task_id % tasks_per_gpu_tp;
+            int gpu_tp_idx = start_gpu_tp + local_gpu_idx;
+            uint8_t* w13_weight_dst = (uint8_t*)w13_weight_ptrs[gpu_tp_idx];
+            ggml_bf16_t* w13_scale_dst = (ggml_bf16_t*)w13_scale_ptrs[gpu_tp_idx];
+            uint8_t* w2_weight_dst = (uint8_t*)w2_weight_ptrs[gpu_tp_idx];
+            ggml_bf16_t* w2_scale_dst = (ggml_bf16_t*)w2_scale_ptrs[gpu_tp_idx];
+            size_t cpu_offset_weight = (size_t)local_gpu_idx * data_per_gpu_tp_weight;
+            size_t cpu_offset_scale = (size_t)local_gpu_idx * data_per_gpu_tp_scale;
+            if (task_type < NUM_WEIGHT_TASKS) {
+              size_t start = (size_t)task_type * weight_chunk_size;
+              size_t end = std::min(start + weight_chunk_size, data_per_gpu_tp_weight);
+              if (start < end)
+                std::memcpy(w13_weight_dst + start,
+                            prefill_gate_bb_[expert_id]->b + cpu_offset_weight + start, end - start);
+            } else if (task_type < NUM_WEIGHT_TASKS * 2) {
+              int chunk_idx = task_type - NUM_WEIGHT_TASKS;
+              size_t start = (size_t)chunk_idx * weight_chunk_size;
+              size_t end = std::min(start + weight_chunk_size, data_per_gpu_tp_weight);
+              if (start < end)
+                std::memcpy(w13_weight_dst + gpu_tp_weight_bytes + start,
+                            prefill_up_bb_[expert_id]->b + cpu_offset_weight + start, end - start);
+            } else if (task_type < NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
+              int chunk_idx = task_type - NUM_WEIGHT_TASKS * 2;
+              size_t cols_per_chunk = (config_.hidden_size + num_down_tasks - 1) / num_down_tasks;
+              size_t col_start = (size_t)chunk_idx * cols_per_chunk;
+              size_t col_end = std::min(col_start + cols_per_chunk, (size_t)config_.hidden_size);
+              size_t weight_per_gpu_col = (config_.intermediate_size / gpu_tps_per_cpu_tp) >> 1;
+              size_t scale_per_gpu_col = (config_.intermediate_size / gpu_tps_per_cpu_tp) / group_size;
+              for (size_t col = col_start; col < col_end; col++) {
+                size_t col_offset_weight = (col * config_.intermediate_size / 2) +
+                                           (local_gpu_idx * data_per_gpu_tp_weight / config_.hidden_size);
+                size_t col_offset_scale = (col * (config_.intermediate_size / group_size)) +
+                                          (local_gpu_idx * data_per_gpu_tp_scale / config_.hidden_size);
+                std::memcpy(w2_weight_dst + col * weight_per_gpu_col,
+                            prefill_down_bb_[expert_id]->b + col_offset_weight, weight_per_gpu_col);
+                fp32_to_bf16(w2_scale_dst + col * scale_per_gpu_col,
+                             prefill_down_bb_[expert_id]->d + col_offset_scale, scale_per_gpu_col);
+              }
+            } else if (task_type == NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
+              fp32_to_bf16(w13_scale_dst, prefill_gate_bb_[expert_id]->d + cpu_offset_scale,
+                           data_per_gpu_tp_scale);
+            } else {
+              fp32_to_bf16(w13_scale_dst + gpu_tp_scale_elem_count,
+                           prefill_up_bb_[expert_id]->d + cpu_offset_scale, data_per_gpu_tp_scale);
+            }
+          },
+          nullptr);
+    }
+  }
 };
 
 template <typename K>
@@ -674,6 +866,43 @@ class TP_MOE<AVX2_RAW_INT4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_RAW_
       this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,
                                             w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
     });
+  }
+
+  // Build a NUMA-local mirror of the weight buffers for fast layerwise prefill.
+  void init_prefill_mirror(int numa_id) {
+    this->prefill_numa_id = numa_id;
+    auto pool = this->config.pool;
+    // Run on the target subpool so aligned_alloc lands on the correct socket
+    pool->get_subpool(numa_id)->do_work_stealing_job(
+        this->tp_count, nullptr,
+        [this](int i) {
+          this->tps[i]->init_prefill_mirror();
+          this->tps[i]->copy_to_prefill_mirror();
+        },
+        nullptr);
+  }
+
+  // Fast prefill path: all memcpy's are local to the GPU's NUMA node.
+  void write_weight_scale_to_buffer_prefill(int gpu_tp_count, int expert_id,
+                                            const std::vector<uintptr_t>& w13_weight_ptrs,
+                                            const std::vector<uintptr_t>& w13_scale_ptrs,
+                                            const std::vector<uintptr_t>& w2_weight_ptrs,
+                                            const std::vector<uintptr_t>& w2_scale_ptrs) {
+    if (this->weights_loaded == false) throw std::runtime_error("Not Loaded");
+    if ((int)w13_weight_ptrs.size() != gpu_tp_count || (int)w13_scale_ptrs.size() != gpu_tp_count ||
+        (int)w2_weight_ptrs.size() != gpu_tp_count || (int)w2_scale_ptrs.size() != gpu_tp_count) {
+      throw std::runtime_error("Pointer arrays size must match gpu_tp_count");
+    }
+    if (this->prefill_numa_id < 0) {
+      throw std::runtime_error("Prefill mirror not initialized; call init_prefill_mirror first");
+    }
+    this->config.pool->get_subpool(this->prefill_numa_id)->do_work_stealing_job(
+        this->tp_count, nullptr,
+        [&, this](int i) {
+          this->tps[i]->write_weights_to_buffer_prefill(gpu_tp_count, this->tp_count, expert_id, this->config,
+                                                        w13_weight_ptrs, w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+        },
+        nullptr);
   }
 };
 

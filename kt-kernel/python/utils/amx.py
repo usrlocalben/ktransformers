@@ -521,6 +521,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             method=method,
             numa_nodes=numa_nodes,
         )
+        self._has_prefill_mirror = False
 
         if NativeMoEWrapper._native_loader_instance is None:
             if method == "RAWINT4":
@@ -746,12 +747,21 @@ class NativeMoEWrapper(BaseMoEWrapper):
         """
         Submit the write_weight_scale_to_buffer task for RAWINT4 KGroup AMX implementation.
 
-        This method submits the C++-exposed task `write_weight_scale_to_buffer_task` to the
-        shared CPUInfer queue. The pointer lists should be plain integer lists (e.g. from
-        tensor.data_ptr()).
+        Automatically uses the NUMA-local prefill mirror when available.
         """
         if self.moe is None:
             raise RuntimeError("MoE instance not initialized; cannot submit write_weight_scale_to_buffer task.")
+
+        if getattr(self, "_has_prefill_mirror", False):
+            self.submit_write_weight_scale_to_buffer_prefill(
+                gpu_tp_count,
+                expert_id,
+                w13_weight_ptrs,
+                w13_scale_ptrs,
+                w2_weight_ptrs,
+                w2_scale_ptrs,
+            )
+            return
 
         if not hasattr(self.moe, "write_weight_scale_to_buffer_task"):
             raise NotImplementedError(
@@ -774,4 +784,48 @@ class NativeMoEWrapper(BaseMoEWrapper):
         Block until previously submitted write_weight_scale_to_buffer tasks finish.
         """
         # The CPUInfer.sync() call blocks until pending tasks complete.
+        self.cpu_infer.sync()
+
+    def submit_init_prefill_mirror(self, numa_id: int):
+        """
+        Build a NUMA-local mirror of weight buffers for fast layerwise prefill.
+        Must be called once per layer after load_weights.
+        """
+        if self.moe is None:
+            raise RuntimeError("MoE instance not initialized; cannot submit init_prefill_mirror task.")
+        if not hasattr(self.moe, "init_prefill_mirror_task"):
+            raise NotImplementedError("init_prefill_mirror_task is not available for this backend.")
+        self.cpu_infer.submit(self.moe.init_prefill_mirror_task(numa_id))
+        self.cpu_infer.sync()
+        self._has_prefill_mirror = True
+
+    def submit_write_weight_scale_to_buffer_prefill(
+        self,
+        gpu_tp_count: int,
+        expert_id: int,
+        w13_weight_ptrs,
+        w13_scale_ptrs,
+        w2_weight_ptrs,
+        w2_scale_ptrs,
+    ):
+        """
+        Fast prefill path using the NUMA-local weight mirror.
+        """
+        if self.moe is None:
+            raise RuntimeError("MoE instance not initialized.")
+        if not hasattr(self.moe, "write_weight_scale_to_buffer_prefill_task"):
+            raise NotImplementedError("write_weight_scale_to_buffer_prefill_task is not available for this backend.")
+        self.cpu_infer.submit(
+            self.moe.write_weight_scale_to_buffer_prefill_task(
+                gpu_tp_count,
+                expert_id,
+                w13_weight_ptrs,
+                w13_scale_ptrs,
+                w2_weight_ptrs,
+                w2_scale_ptrs,
+            )
+        )
+
+    def sync_write_weight_scale_to_buffer_prefill(self):
+        """Block until prefill mirror write tasks finish."""
         self.cpu_infer.sync()

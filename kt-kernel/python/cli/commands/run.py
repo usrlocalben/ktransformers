@@ -57,6 +57,20 @@ from kt_kernel.cli.utils.user_model_registry import UserModelRegistry
 @click.option(
     "--kt-gpu-prefill-threshold", "kt_gpu_prefill_threshold", type=int, default=None, help="GPU prefill token threshold"
 )
+@click.option(
+    "--kt-prefill-mirror-layers",
+    "kt_prefill_mirror_layers",
+    type=int,
+    default=None,
+    help="Number of layers to mirror on the prefill socket for fast H2D",
+)
+@click.option(
+    "--kt-prefill-mirror-socket",
+    "kt_prefill_mirror_socket",
+    type=int,
+    default=None,
+    help="CPU socket (0 or 1) to place the prefill mirror on",
+)
 @click.option("--attention-backend", default=None, help="Attention backend")
 @click.option("--max-total-tokens", "max_total_tokens", type=int, default=None, help="Maximum total tokens")
 @click.option("--max-running-requests", "max_running_requests", type=int, default=None, help="Maximum running requests")
@@ -95,6 +109,8 @@ def run(
     weights_path: Optional[str],
     kt_method: Optional[str],
     kt_gpu_prefill_threshold: Optional[int],
+    kt_prefill_mirror_layers: Optional[int],
+    kt_prefill_mirror_socket: Optional[int],
     attention_backend: Optional[str],
     max_total_tokens: Optional[int],
     max_running_requests: Optional[int],
@@ -152,6 +168,8 @@ def run(
         weights_path=weights_path_obj,
         kt_method=kt_method,
         kt_gpu_prefill_threshold=kt_gpu_prefill_threshold,
+        kt_prefill_mirror_layers=kt_prefill_mirror_layers,
+        kt_prefill_mirror_socket=kt_prefill_mirror_socket,
         attention_backend=attention_backend,
         max_total_tokens=max_total_tokens,
         max_running_requests=max_running_requests,
@@ -179,6 +197,8 @@ def _run_impl(
     weights_path: Optional[Path],
     kt_method: Optional[str],
     kt_gpu_prefill_threshold: Optional[int],
+    kt_prefill_mirror_layers: Optional[int],
+    kt_prefill_mirror_socket: Optional[int],
     attention_backend: Optional[str],
     max_total_tokens: Optional[int],
     max_running_requests: Optional[int],
@@ -445,6 +465,8 @@ def _run_impl(
     # KT-kernel options
     final_kt_method = resolve(kt_method, "inference.kt_method", "AMXINT4")
     final_kt_gpu_prefill_threshold = resolve(kt_gpu_prefill_threshold, "inference.kt_gpu_prefill_token_threshold", 4096)
+    final_kt_prefill_mirror_layers = resolve(kt_prefill_mirror_layers, "inference.kt_prefill_mirror_layers", 0)
+    final_kt_prefill_mirror_socket = resolve(kt_prefill_mirror_socket, "inference.kt_prefill_mirror_socket", 0)
 
     # SGLang options
     final_attention_backend = resolve(attention_backend, "inference.attention_backend", "flashinfer")
@@ -481,6 +503,8 @@ def _run_impl(
         tensor_parallel_size=final_tensor_parallel_size,
         kt_method=final_kt_method,
         kt_gpu_prefill_threshold=final_kt_gpu_prefill_threshold,
+        kt_prefill_mirror_layers=final_kt_prefill_mirror_layers,
+        kt_prefill_mirror_socket=final_kt_prefill_mirror_socket,
         attention_backend=final_attention_backend,
         max_total_tokens=final_max_total_tokens,
         max_running_requests=final_max_running_requests,
@@ -589,6 +613,8 @@ def _build_sglang_command(
     tensor_parallel_size: int,
     kt_method: str,
     kt_gpu_prefill_threshold: int,
+    kt_prefill_mirror_layers: int,
+    kt_prefill_mirror_socket: int,
     attention_backend: str,
     max_total_tokens: int,
     max_running_requests: int,
@@ -653,6 +679,15 @@ def _build_sglang_command(
                 "--kt-enable-dynamic-expert-update",  # Enable dynamic expert updates
             ]
         )
+        if kt_prefill_mirror_layers > 0:
+            cmd.extend(
+                [
+                    "--kt-prefill-mirror-layers",
+                    str(kt_prefill_mirror_layers),
+                    "--kt-prefill-mirror-socket",
+                    str(kt_prefill_mirror_socket),
+                ]
+            )
         if kt_numa_nodes is not None:
             cmd.extend(["--kt-numa-nodes", *map(str, kt_numa_nodes)])
 

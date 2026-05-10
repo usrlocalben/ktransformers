@@ -33,6 +33,7 @@ class TP_MOE_Common : public MoE_Interface {
   std::vector<typename T::output_t*> local_output_numa;
   typename T::output_t* local_output = nullptr;
 
+  int prefill_numa_id = -1;
   bool weights_loaded = false;
 
 #ifdef FORWARD_TIME_REPORT
