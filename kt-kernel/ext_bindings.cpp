@@ -814,6 +814,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("down_type", &GeneralMOEConfig::down_type)
       .def_readwrite("hidden_type", &GeneralMOEConfig::hidden_type)
       .def_readwrite("max_cache_depth", &GeneralMOEConfig::max_cache_depth)
+      // V4-Flash 2604B SwiGLU clamp limit (0.0 = disabled). See common.hpp.
+      .def_readwrite("swiglu_limit", &GeneralMOEConfig::swiglu_limit)
       .def_readwrite("prefill_numa_id", &GeneralMOEConfig::prefill_numa_id)
 
       ;
@@ -847,10 +849,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernel224BF16>>(moe_module, "AMXBF16_MOE");
   bind_moe_module<AMX_FP8_MOE_TP<amx::GemmKernel224FP8>>(moe_module, "AMXFP8_MOE");
   bind_moe_module<AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>>(moe_module, "AMXFP8PerChannel_MOE");
-#endif
-#if defined(__AVX512BF16__)
   bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>>(moe_module, "AMXFP4_KGroup_MOE");
 #endif
+#if defined(__AVX512BF16__)
   // SFT MoE with LoRA support (BF16, INT8, INT4, AWQ, K2)
   bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224BF>>(moe_module, "AMXBF16_SFT_MOE");
   bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224Int8>>(moe_module, "AMXInt8_SFT_MOE");
@@ -870,6 +871,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   //     moe_module, "AMXInt4_1KGroup_SFT_MOE_SkipLoRA");
   // bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224Int4SmallKGroup, AMX_K2_MOE_TP, true>>(
   //     moe_module, "AMXInt4_KGroup_SFT_MOE_SkipLoRA");
+#endif
 #endif
 // AVX2 backends — available on all x86_64 (no AMX/AVX512 requirement)
 #if defined(__x86_64__)

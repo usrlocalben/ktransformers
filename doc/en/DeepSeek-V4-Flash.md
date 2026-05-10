@@ -9,16 +9,18 @@ This tutorial demonstrates how to run **DeepSeek-V4-Flash** model inference usin
   - [Hardware Requirements](#hardware-requirements)
   - [Prerequisites](#prerequisites)
   - [Step 1: Download Model Weights](#step-1-download-model-weights)
-  - [Step 2: Launch SGLang Server](#step-2-launch-sglang-server)
-    - [Launch Command (8× RTX 5090 Example)](#launch-command-8-rtx-5090-example)
-  - [Step 3: Send Inference Requests](#step-3-send-inference-requests)
+  - [Step 2: Quantize CPU Weights (Optional, for AMXINT4 mode)](#step-2-quantize-cpu-weights-optional-for-amxint4-mode)
+  - [Step 3: Launch SGLang Server](#step-3-launch-sglang-server)
+    - [Launch Command (Single RTX 5090 Example)](#launch-command-single-rtx-5090-example)
+    - [Optional: Enable MTP (Multi-Token Prediction) Speculative Decoding](#optional-enable-mtp-multi-token-prediction-speculative-decoding)
+  - [Step 4: Send Inference Requests](#step-4-send-inference-requests)
     - [Decode](#decode)
     - [Interactive Chat (kt chat)](#interactive-chat-kt-chat)
 
 ## Hardware Requirements
 
 **Validated Configuration (this tutorial):**
-- **GPU**: 8× NVIDIA RTX 5090 (32GB VRAM each, SM_120)
+- **GPU**: 1× NVIDIA RTX 5090 (32GB VRAM, SM_120)
 - **CPU**: x86 CPU with AVX512 support
 - **RAM**: ≥256GB system memory
 - **Storage**: ~340GB for model weights
@@ -30,8 +32,8 @@ This tutorial demonstrates how to run **DeepSeek-V4-Flash** model inference usin
 | Hopper (H100 / H200) | SM_90 | triton_kernels | flash_mla wheel | — |
 | Datacenter Blackwell (B100 / B200) | SM_100 | trtllm-fp4 | Triton fallback | — |
 | Consumer Blackwell (RTX 5090) | SM_120 | triton_kernels | Triton fallback | ✓ |
-| Ada Lovelace (RTX 4090 / L20 / L40) | SM_89 | triton_kernels | Triton fallback | — |
-| Ampere (A100 / A6000) | SM_80 / SM_86 | triton_kernels | Triton fallback | — |
+| Ada Lovelace (RTX 4090 / L20 / L40) | SM_89 | triton_kernels | Triton fallback | ✓ |
+| Ampere (A100 / A6000) | SM_80 / SM_86 | triton_kernels | Triton fallback | ✗ (not supported) |
 
 
 ## Prerequisites
@@ -61,6 +63,12 @@ This tutorial demonstrates how to run **DeepSeek-V4-Flash** model inference usin
    ```
    `transformers` 5.x adds default-valued fields to `PretrainedConfig` that make `DeepSeekV4Config`'s dataclass declaration raise `TypeError: non-default argument 'quantization_config' follows default argument` at import time. `sglang-kt`'s pyproject does not pin `transformers`, so a fresh `pip install` will pull the latest 5.x and break server startup; pinning explicitly to `4.57.1` is required until the upstream fix lands.
 
+5. **tilelang** (manual install — required for the NSA sparse-MLA tilelang indexer path used on non-Hopper GPUs):
+   ```bash
+   pip install tilelang
+   ```
+   `sglang-kt`'s pyproject does not declare `tilelang` as a dependency, so `pip install ./python[all]` will not pull it in. Validated with `tilelang==0.1.8`.
+
 
 ## Step 1: Download Model Weights
 
@@ -70,40 +78,93 @@ huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
   --local-dir /path/to/models/DeepSeek-V4-Flash
 ```
 
-## Step 2: Launch SGLang Server
+## Step 2: Quantize CPU Weights (Optional, for AMXINT4 mode)
 
-### Launch Command (8× RTX 5090 Example)
+This step is only needed if you want to run the CPU experts in **AMXINT4** mode instead (e.g., on Intel Xeon with AMX where INT4 is preferred over MXFP4).
+
+### Conversion Command
+
+For a 4-NUMA system with 64 physical cores assigned to CPU inference:
 
 ```bash
+cd /path/to/ktransformers/kt-kernel
+
+python scripts/convert_cpu_weights_ds4.py \
+  --input-path /path/to/models/DeepSeek-V4-Flash \
+  --input-type fp4 \
+  --output /path/to/models/DeepSeek-V4-Flash-AMXINT4 \
+  --quant-method int4 \
+  --cpuinfer-threads 64 \
+  --threadpool-count 4 \
+  --no-merge-safetensor
+```
+
+The script auto-detects `model_type=deepseek_v4` and `expert_dtype=fp4` from `config.json`, dequantizes the MXFP4 routed experts (group size 32) on GPU, and re-quantizes them to AMX-INT4 layout on CPU. Both HF (`model.layers.{L}.mlp.experts.{E}.{proj}.weight`) and V4 inference (`layers.{L}.ffn.experts.{E}.{w1,w2,w3}.weight`) key formats are supported.
+
+To use the converted weights, replace the relevant flags in Step 3's launch command:
+
+```bash
+  --kt-weight-path /path/to/models/DeepSeek-V4-Flash-AMXINT4 \
+  --kt-method AMXINT4 \
+```
+
+## Step 3: Launch SGLang Server
+
+### Launch Command (Single RTX 5090 Example)
+
+```bash
+export FLASHINFER_CUDA_ARCH_LIST=12.0a
+export TORCH_CUDA_ARCH_LIST="12.0+PTX"
+export SGLANG_DSV4_MODE=2604
+export SGLANG_DSV4_2604_SUBMODE=2604B
+
 numactl --interleave=all python -m sglang.launch_server \
-  --host 127.0.0.1 \
-  --port 30000 \
+  --host 0.0.0.0 --port 30000 \
   --model /path/to/models/DeepSeek-V4-Flash \
   --kt-weight-path /path/to/models/DeepSeek-V4-Flash \
   --kt-method MXFP4 \
-  --kt-num-gpu-experts 144 \
-  --kt-cpuinfer 8 \
+  --kt-num-gpu-experts 10 \
+  --kt-cpuinfer 60 \
   --kt-threadpool-count 2 \
   --kt-gpu-prefill-token-threshold 4096 \
   --kt-enable-dynamic-expert-update \
-  --tensor-parallel-size 8 \
+  --tensor-parallel-size 1 \
+  --context-length 16384 \
   --attention-backend flashinfer \
-  --mem-fraction-static 0.80 \
+  --mem-fraction-static 0.85 \
   --chunked-prefill-size 2048 \
-  --max-running-requests 4 \
-  --max-total-tokens 32768 \
-  --watchdog-timeout 3000 \
+  --max-prefill-tokens 2048 \
+  --max-running-requests 2 \
+  --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \
-  --cuda-graph-bs 1 2 4 \
-  --cuda-graph-max-bs 4 \
-  --trust-remote-code
+  --trust-remote-code \
+  --cuda-graph-bs 1 \
+  --cuda-graph-max-bs 1 \
+  --disable-radix-cache \
+  --skip-server-warmup
 ```
+
+Decode throughput: **20+ tok/s** on a single RTX 5090.
 
 It takes about 4-5 minutes to start the server (weight load + CUDA Graph capture).
 
 See [KT-Kernel Parameters](https://github.com/kvcache-ai/ktransformers/tree/main/kt-kernel#kt-kernel-parameters) for detailed parameter tuning guidelines.
 
-## Step 3: Send Inference Requests
+### Optional: Enable MTP (Multi-Token Prediction) Speculative Decoding
+
+V4-Flash ships a NextN draft head that can be run as EAGLE-style speculative decoding for ~1.2× throughput on single-request decode (validated 26.5 → 32.74 tok/s on 8× RTX 5090, 90% accept rate at chain depth 1).
+
+Append the following flags to the launch command above:
+
+```bash
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-moe-runner-backend auto \
+```
+
+## Step 4: Send Inference Requests
 
 ### Decode
 
