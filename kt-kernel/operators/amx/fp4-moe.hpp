@@ -593,8 +593,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                                 cpu_tp_scale_elem_count);
             }
           },
-          nullptr);
-    } else {
+             nullptr);
+      } else {
       int gpu_tps_per_cpu_tp = gpu_tp_count / cpu_tp_count;
       int start_gpu_tp = tp_part_idx * gpu_tps_per_cpu_tp;
 
@@ -722,7 +722,7 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
               uint8_t* src_down = (uint8_t*)config.down_projs[0][expert_id];
               ggml_bf16_t* src_gate_scale = (ggml_bf16_t*)config.gate_scales[0][expert_id];
               ggml_bf16_t* src_up_scale = (ggml_bf16_t*)config.up_scales[0][expert_id];
-              ggml_bf16_t* src_down_scale = (ggml_bf16_t*)config.down_scales[0][expert_id];
+              ggml_bf16_t*  src_down_scale = (ggml_bf16_t*)config.down_scales[0][expert_id];
 
               memcpy((uint8_t*)tpc.gate_proj + ((expert_id * weight_elem_count) >> 1),
                      src_gate + ((i * weight_elem_count) >> 1), (weight_elem_count >> 1));
@@ -737,15 +737,15 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
                 memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
                        src_down + ((col * config.intermediate_size + i * tpc.intermediate_size) >> 1),
                        (tpc.intermediate_size >> 1));
-                memcpy((ggml_bf16_t*)tpc.down_scale +
-                           (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
-                       src_down_scale +
-                           (col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
-                       sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
+                  memcpy((ggml_bf16_t*)tpc.down_scale +
+                             (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
+                          src_down_scale +
+                             (col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
+                          sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
               }
-            },
-            nullptr);
-      } else {
+             },
+             nullptr);
+       } else {
         if (tpc.load == false) {
           pool->get_subpool(i)->do_work_stealing_job(
               tpc.expert_num, nullptr,
@@ -760,30 +760,30 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
                        (uint8_t*)config.up_proj +
                            ((expert_id * config.intermediate_size * config.hidden_size + i * weight_elem_count) >> 1),
                        (weight_elem_count >> 1));
-                memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
-                       (ggml_bf16_t*)config.gate_scale +
-                           (expert_id * (config.hidden_size / group_size) * config.intermediate_size +
-                            i * scales_elem_count),
-                       sizeof(ggml_bf16_t) * scales_elem_count);
-                memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
-                       (ggml_bf16_t*)config.up_scale +
-                           (expert_id * (config.hidden_size / group_size) * config.intermediate_size +
-                            i * scales_elem_count),
-                       sizeof(ggml_bf16_t) * scales_elem_count);
+                  memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
+                         (ggml_bf16_t*)config.gate_scale +
+                             (expert_id * (config.hidden_size / group_size) * config.intermediate_size +
+                              i * scales_elem_count),
+                         sizeof(ggml_bf16_t) * scales_elem_count);
+                  memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
+                         (ggml_bf16_t*)config.up_scale +
+                             (expert_id * (config.hidden_size / group_size) * config.intermediate_size +
+                              i * scales_elem_count),
+                         sizeof(ggml_bf16_t) * scales_elem_count);
 
-                for (size_t col = 0; col < config.hidden_size; col++) {
-                  memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
-                         (uint8_t*)config.down_proj + ((expert_id * config.intermediate_size * config.hidden_size +
-                                                        col * config.intermediate_size + i * tpc.intermediate_size) >>
-                                                       1),
-                         (tpc.intermediate_size >> 1));
-                  memcpy((ggml_bf16_t*)tpc.down_scale +
-                             (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
-                         (ggml_bf16_t*)config.down_scale +
-                             ((expert_id * (config.intermediate_size / group_size) * config.hidden_size) +
-                              col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
-                         sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
-                }
+                  for (size_t col = 0; col < config.hidden_size; col++) {
+                    memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
+                           (uint8_t*)config.down_proj + ((expert_id * config.intermediate_size * config.hidden_size +
+                                                          col * config.intermediate_size + i * tpc.intermediate_size) >>
+                                                         1),
+                           (tpc.intermediate_size >> 1));
+                    memcpy((ggml_bf16_t*)tpc.down_scale +
+                               (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
+                           (ggml_bf16_t*)config.down_scale +
+                               ((expert_id * (config.intermediate_size / group_size) * config.hidden_size) +
+                                col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
+                           sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
+                 }
               },
               nullptr);
         }
