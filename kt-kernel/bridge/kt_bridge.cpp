@@ -52,6 +52,7 @@
 #include "operators/avx2/bf16-moe.hpp"
 #include "operators/avx2/fp8-moe.hpp"
 #include "operators/avx2/gptq_int4-moe.hpp"
+#include "operators/avx2/mxfp4-moe.hpp"
 #include "operators/avx2/rawint4-moe.hpp"
 #endif
 
@@ -329,6 +330,7 @@ ktb_moe_t ktb_moe_create(ktb_engine_t e,
 #if defined(__x86_64__)
     avx2_fallback:
         switch (method) {
+            DISPATCH_AVX2_CASE(AVX2_MXFP4_MOE_TP<avx2::GemmKernelAVX2MXFP4>,   KTB_MXFP4)
             DISPATCH_AVX2_CASE(AVX2_BF16_MOE_TP<avx2::GemmKernelAVX2BF16>,     KTB_BF16)
             DISPATCH_AVX2_CASE(AVX2_FP8_MOE_TP<avx2::GemmKernelAVX2FP8>,        KTB_FP8)
             DISPATCH_AVX2_CASE(AVX2_GPTQ_INT4_MOE_TP<avx2::GemmKernelAVX2GPTQInt4>, KTB_GPTQ_INT4)
