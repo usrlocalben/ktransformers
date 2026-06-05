@@ -67,6 +67,11 @@ typedef enum {
     KTB_AMXINT8,
 } ktb_method_t;
 
+typedef enum {
+    KTB_IO_BF16 = 0,
+    KTB_IO_F32,
+} ktb_io_type_t;
+
 /**
  * Create a MoE layer (weights are NOT loaded yet).
  *
@@ -76,7 +81,12 @@ typedef enum {
  * @param num_experts_per_tok  Top-k (e.g. 6 for DeepSeek V4).
  * @param hidden_size          Model hidden dimension (e.g. 7168).
  * @param intermediate_size    MoE intermediate size (e.g. 2048).
- * @param method               Quantization / kernel method.
+ * @param io_type              I/O datatype for activations (KTB_IO_BF16 or KTB_IO_F32).
+ *                             Most methods only support KTB_IO_BF16; KTB_IO_F32 is
+ *                             currently only valid with KTB_MXFP4.
+ * @param method               FFN weight quantization / kernel method.
+ * @param group_size           Quantization group size (e.g. 32 for MXFP4).
+ *                             Pass 0 for methods that don't use grouped quantization.
  * @param swiglu_limit         Clamp value for SiLU(gate) * up activations.
  *                             Pass 0.0f to disable clamping.
  * @return MoE handle, or NULL on failure.
@@ -87,7 +97,9 @@ ktb_moe_t ktb_moe_create(ktb_engine_t e,
                          int num_experts_per_tok,
                          int hidden_size,
                          int intermediate_size,
+                         ktb_io_type_t io_type,
                          ktb_method_t method,
+                         int group_size,
                          float swiglu_limit);
 
 void ktb_moe_destroy(ktb_moe_t m);
@@ -153,7 +165,9 @@ void ktb_moe_forward(ktb_moe_t m,
 
 /**
  * Same as ktb_moe_forward but accepts float32 I/O and int32 expert IDs.
- * The bridge allocates internal scratch, converts f32->bf16 and int32->int64,
+ * When the MoE was created with KTB_IO_F32 (f32-native kernel), data is passed
+ * directly without any conversion. For KTB_IO_BF16 MoE layers,
+ * the bridge allocates internal scratch, converts f32->bf16 and int32->int64,
  * runs the kernel, then converts the output back to f32.
  * This is the function ds4 will call to keep its existing float32 tensor layout.
  */

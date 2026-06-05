@@ -42,6 +42,7 @@
 #include "operators/amx/bf16-moe.hpp"
 #include "operators/amx/k2-moe.hpp"
 #include "operators/amx/moe_base.hpp"
+#include "operators/amx/fp4-moe-f32.hpp"
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -228,6 +229,9 @@ struct ktb_moe {
     MoE_Interface*         iface = nullptr;
     std::function<void()>  load_weights_fn;
     GeneralMOEConfig       config;
+    ktb_io_type_t          io_type;
+    ktb_method_t           method;
+    bool                   f32_native = false;
 
     /* For the per-expert pointer mode we stash copies of the
      * pointer vectors so that gate_projs / gate_scales etc.
@@ -253,10 +257,12 @@ static void set_projs(std::vector<std::vector<void*>>& dst,
     for (int i = 0; i < n; ++i) dst[0][i] = const_cast<void*>(src[i]);
 }
 
-#define DISPATCH_AMX_CASE(T, C) \
-    case C: { \
-        using M = T; \
-        auto concrete = std::make_shared<TP_MOE<M>>(cfg); \
+#define KTB_PAIR(io, m) (((int)(io) << 8) | (int)(m))
+
+#define DISPATCH_AMX_CASE(T, IO, M) \
+    case KTB_PAIR(IO, M): { \
+        using K = T; \
+        auto concrete = std::make_shared<TP_MOE<K>>(cfg); \
         m->iface = concrete.get(); \
         m->load_weights_fn = [concrete, m]() { \
             concrete->config = m->config; \
@@ -279,12 +285,14 @@ static void set_projs(std::vector<std::vector<void*>>& dst,
 
 ktb_moe_t ktb_moe_create(ktb_engine_t e,
                          int layer_idx,
-                          int num_experts,
-                          int num_experts_per_tok,
-                          int hidden_size,
-                          int intermediate_size,
-                          ktb_method_t method,
-                          float swiglu_limit) {
+                         int num_experts,
+                         int num_experts_per_tok,
+                         int hidden_size,
+                         int intermediate_size,
+                         ktb_io_type_t io_type,
+                         ktb_method_t method,
+                         int group_size,
+                         float swiglu_limit) {
     if (!e || !e->cpuinfer) return nullptr;
 
     GeneralMOEConfig cfg(num_experts, num_experts_per_tok, hidden_size, intermediate_size);
@@ -294,37 +302,38 @@ ktb_moe_t ktb_moe_create(ktb_engine_t e,
     cfg.swiglu_limit = swiglu_limit;
     cfg.gpu_experts_mask = nullptr;
     cfg.num_gpu_experts = 0;
-
-    /* group_size must be non-zero for int4/fp4/8 BuffersB that do k/group_size.  The
-     * actual value is overwrriten by ktb_moe_load_weights_*.                 */
-    if (method == KTB_MXFP4 || method == KTB_FP8 || method == KTB_FP8_PERCHANNEL ||
-        method == KTB_RAWINT4 || method == KTB_AMXINT4 || method == KTB_GPTQ_INT4) {
-        cfg.quant_config.group_size = 32;
-    }
+    cfg.quant_config.group_size = group_size;
 
     auto m = new ktb_moe;
     m->config = cfg;
+    m->io_type = io_type;
+    m->method = method;
 
     try {
 #if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
-        switch (method) {
-            DISPATCH_AMX_CASE(AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>, KTB_MXFP4)
-            DISPATCH_AMX_CASE(AMX_FP8_MOE_TP<amx::GemmKernel224FP8>,           KTB_FP8)
-            DISPATCH_AMX_CASE(AMX_BF16_MOE_TP<amx::GemmKernel224BF16>,         KTB_BF16)
-            DISPATCH_AMX_CASE(AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>, KTB_FP8_PERCHANNEL)
-            DISPATCH_AMX_CASE(AMX_K2_MOE_TP<amx::GemmKernel224Int4SmallKGroup>, KTB_RAWINT4)
-            DISPATCH_AMX_CASE(AMX_MOE_TP<amx::GemmKernel224Int4>,              KTB_AMXINT4)
-            DISPATCH_AMX_CASE(AMX_MOE_TP<amx::GemmKernel224Int8>,              KTB_AMXINT8)
-            default:
+        switch (KTB_PAIR(io_type, method)) {
+            DISPATCH_AMX_CASE(AMX_FP4_MOE_TP_F32<amx::GemmKernel224MXFP4SmallKGroupF32>, KTB_IO_F32, KTB_MXFP4)
+            DISPATCH_AMX_CASE(AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>,         KTB_IO_BF16, KTB_MXFP4)
+            DISPATCH_AMX_CASE(AMX_FP8_MOE_TP<amx::GemmKernel224FP8>,                     KTB_IO_BF16, KTB_FP8)
+            DISPATCH_AMX_CASE(AMX_BF16_MOE_TP<amx::GemmKernel224BF16>,                   KTB_IO_BF16, KTB_BF16)
+            DISPATCH_AMX_CASE(AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>, KTB_IO_BF16, KTB_FP8_PERCHANNEL)
+            DISPATCH_AMX_CASE(AMX_K2_MOE_TP<amx::GemmKernel224Int4SmallKGroup>,           KTB_IO_BF16, KTB_RAWINT4)
+            DISPATCH_AMX_CASE(AMX_MOE_TP<amx::GemmKernel224Int4>,                        KTB_IO_BF16, KTB_AMXINT4)
+            DISPATCH_AMX_CASE(AMX_MOE_TP<amx::GemmKernel224Int8>,                        KTB_IO_BF16, KTB_AMXINT8)
+            default: {
+                if (io_type == KTB_IO_F32) {
+                    fprintf(stderr, "[kt_bridge] F32 I/O is only supported with MXFP4 method\n");
+                    throw std::runtime_error("unsupported (io_type, method) pair");
+                }
 #if defined(__x86_64__)
                 goto avx2_fallback;
 #else
                 throw std::runtime_error("Method not available on this platform");
 #endif
+            }
         }
-        if (m->iface) return m;  // AMX/AVX path succeeded, don't fall into AVX2
-#else
-        goto avx2_fallback;
+        if (io_type == KTB_IO_F32) m->f32_native = true;
+        if (m->iface) return m;
 #endif
 
 #if defined(__x86_64__)
@@ -349,6 +358,7 @@ ktb_moe_t ktb_moe_create(ktb_engine_t e,
 
 #undef DISPATCH_AMX_CASE
 #undef DISPATCH_AVX2_CASE
+#undef KTB_PAIR
 
 void ktb_moe_destroy(ktb_moe_t m) {
     delete m;
@@ -551,9 +561,19 @@ void ktb_moe_forward_f32(ktb_moe_t m,
 
     int H = m->config.hidden_size;
     int K = m->config.num_experts_per_tok;
+
+    if (m->f32_native) {
+        thread_local std::vector<int64_t> scratch_ids;
+        if (scratch_ids.size() < (size_t)n_tokens * K) scratch_ids.resize((size_t)n_tokens * K);
+        for (int i = 0; i < n_tokens * K; ++i) scratch_ids[i] = expert_ids_i32[i];
+
+        m->config.swiglu_limit = swiglu_limit;
+        m->iface->forward(n_tokens, K, scratch_ids.data(), weights, input_f32, output_f32, incremental);
+        return;
+    }
+
     size_t n_elem = (size_t)n_tokens * H;
 
-    /* Thread-local scratch (assume caller is single-threaded). */
     thread_local std::vector<ggml_bf16_t> scratch_in;
     thread_local std::vector<ggml_bf16_t> scratch_out;
     thread_local std::vector<int64_t>     scratch_ids;

@@ -362,6 +362,14 @@ if(KTRANSFORMERS_CPU_MOE_AMD)
     # BLIS paths and apply them after the module target is created.
 endif()
 
+find_library(NUMA_LIBRARY NAMES numa)
+# if(NUMA_LIBRARY)
+#     message(STATUS "NUMA library found: ${NUMA_LIBRARY} - enabling NUMA support")
+#     target_link_libraries(${PROJECT_NAME} PRIVATE ${NUMA_LIBRARY})
+# else()
+#     message(FATAL_ERROR "NUMA library not found, please install NUMA, sudo apt install libnuma-dev")
+# endif()
+
 
 if(HOST_IS_X86)
     if(KTRANSFORMERS_CPU_USE_AMX_AVX512)
@@ -392,6 +400,8 @@ if(HOST_IS_X86)
         message(STATUS "AVX512 extensions: F=${LLAMA_AVX512}, BF16=${LLAMA_AVX512_BF16}, VNNI=${LLAMA_AVX512_VNNI}, VBMI=${LLAMA_AVX512_VBMI}")
     endif()
 endif()
+
+find_library(NUMA_LIBRARY NAMES numa)
 
 message(STATUS "ARCH_FLAGS: ${ARCH_FLAGS}")
 
@@ -741,14 +751,4 @@ if(KTRANSFORMERS_USE_ROCM)
 endif()
 if(KTRANSFORMERS_USE_MUSA)
     target_link_libraries(${PROJECT_NAME} PRIVATE MUSA::musart)
-endif()
-
-
-
-find_library(NUMA_LIBRARY NAMES numa)
-if(NUMA_LIBRARY)
-    message(STATUS "NUMA library found: ${NUMA_LIBRARY} - enabling NUMA support")
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${NUMA_LIBRARY})
-else()
-    message(FATAL_ERROR "NUMA library not found, please install NUMA, sudo apt install libnuma-dev")
 endif()
